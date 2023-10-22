@@ -11,15 +11,10 @@ from peft import PeftModel, get_peft_model
 
 replace_peft_model_with_int4_lora_model()
 
-from alpaca_lora_4bit.monkeypatch.llama_attn_hijack_xformers import (
-    hijack_llama_attention,
+from alpaca_lora_4bit.monkeypatch.llama_flash_attn_monkey_patch import (
+    replace_llama_attn_with_flash_attn,
 )
-hijack_llama_attention()
-
-# from alpaca_lora_4bit.monkeypatch.llama_flash_attn_monkey_patch import (
-#     replace_llama_attn_with_flash_attn,
-# )
-# replace_llama_attn_with_flash_attn()
+replace_llama_attn_with_flash_attn()
 
 def find_pt_checkpoint(model_id):
     model_name_or_path = Path(model_id)

@@ -1,8 +1,8 @@
 from pathlib import Path
 
 from alpaca_lora_4bit import autograd_4bit
-from alpaca_lora_4bit.autograd_4bit import load_llama_model_4bit_low_ram
-from alpaca_lora_4bit.gradient_checkpointing import apply_gradient_checkpointing
+from alpaca_lora_4bit.autograd_4bit import load_auto_model_4bit_low_ram
+from alpaca_lora_4bit.gradient_checkpointing import apply_gradient_checkpointing_auto
 
 from alpaca_lora_4bit.monkeypatch.peft_tuners_lora_monkey_patch import (
     replace_peft_model_with_int4_lora_model,
@@ -11,10 +11,10 @@ from peft import PeftModel, get_peft_model
 
 replace_peft_model_with_int4_lora_model()
 
-from alpaca_lora_4bit.monkeypatch.llama_attn_hijack_xformers import (
-    hijack_llama_attention,
-)
-hijack_llama_attention()
+# from alpaca_lora_4bit.monkeypatch.llama_attn_hijack_xformers import (
+#     hijack_llama_attention,
+# )
+# hijack_llama_attention()
 
 # from alpaca_lora_4bit.monkeypatch.llama_flash_attn_monkey_patch import (
 #     replace_llama_attn_with_flash_attn,
@@ -57,7 +57,7 @@ def load_model_gptq(
 
     config_path = model_id
     model_path = find_pt_checkpoint(model_id)
-    model, tokenizer = load_llama_model_4bit_low_ram(
+    model, tokenizer = load_auto_model_4bit_low_ram(
         config_path,
         model_path,
         groupsize=group_size,
@@ -84,7 +84,7 @@ def load_model_gptq(
     if gradient_checkpointing:
         # Use gradient checkpointing
         print("Applying gradient checkpointing ...")
-        apply_gradient_checkpointing(model, checkpoint_ratio=1.0)
+        apply_gradient_checkpointing_auto(model, checkpoint_ratio=1.0)
 
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token

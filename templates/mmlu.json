@@ -1,0 +1,8 @@
+{
+        "input": "input question",
+        "A": "option a", 
+        "B": "option b", 
+        "C": "option c", 
+        "D": "option d",
+        "target": "rigth answer"    
+}

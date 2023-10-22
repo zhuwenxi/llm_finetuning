@@ -7,11 +7,16 @@ import numpy as np
 import torch
 import transformers
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    set_peft_model_state_dict,
+    prepare_model_for_kbit_training,
+)
 from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    LlamaTokenizer,
+    AutoTokenizer,
     Trainer,
     TrainerCallback,
     TrainerControl,
@@ -54,6 +59,48 @@ class PeftTrainer(Trainer):
             self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
 
 
+def ours_prepare_model_for_kbit_training(model, use_gradient_checkpointing=True):
+    r"""
+    This method wraps the entire protocol for preparing a model before running a training. This includes:
+        1- Cast the layernorm in fp32 2- making output embedding layer require grads 3- Add the upcasting of the lm
+        head to fp32
+
+    Args:
+        model, (`transformers.PreTrainedModel`):
+            The loaded model from `transformers`
+    """
+    loaded_in_kbit = getattr(model, "is_loaded_in_8bit", False) or getattr(
+        model, "is_loaded_in_4bit", False
+    )
+    is_gptq_quantized = getattr(model, "quantization_method", None) == "gptq"
+    for name, param in model.named_parameters():
+        # freeze base model's layers
+        param.requires_grad = False
+
+    # if not is_gptq_quantized:
+    if not is_gptq_quantized and not loaded_in_kbit:
+        # cast all non INT8 parameters to fp32
+        for param in model.parameters():
+            if (param.dtype == torch.float16) or (param.dtype == torch.bfloat16):
+                param.data = param.data.to(torch.float32)
+
+    if (loaded_in_kbit or is_gptq_quantized) and use_gradient_checkpointing:
+        # For backward compatibility
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+        # enable gradient checkpointing for memory efficiency
+        model.gradient_checkpointing_enable()
+
+    return model
+
+
 class PeftSavingCallback(TrainerCallback):
     """Correctly save PEFT model and not full model"""
 
@@ -84,60 +131,20 @@ class PeftSavingCallback(TrainerCallback):
         self._save(kwargs["model"], folder)
 
 
-def load_hf_model(
-    base_model,
-    lora_config=None,
-    mode=8,
-    gradient_checkpointing=False,
-    device_map="auto",
-):
-    from peft import prepare_model_for_kbit_training
-
-    kwargs = {"device_map": device_map}
-    if mode == 8:
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=0.0,
-        )
-    elif mode == 4:
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-    elif mode == 16:
-        kwargs["torch_dtype"] = torch.float16
-
-    model = AutoModelForCausalLM.from_pretrained(base_model, **kwargs)
-
-    # setup tokenizer
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
-
-    if gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    model = prepare_model_for_kbit_training(model)
-
-    if lora_config:
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
-
-    return model, tokenizer
-
-
 # noinspection PyTypeChecker
 def train(
     # model/data params
-    base_model: str = "",  # the only required argument
-    data_path: str = "yahma/alpaca-cleaned",
-    output_dir: str = "./lora-alpaca",
+    base_model: str = "/data_test/LLM/huggingface/checkpoints/Qwen-14B",  # the only required argument
+    data_path: str = "/public/home/macong/neurIPS2023/data/alpaca_data_extra_long.json",
+    output_dir: str = "./output_test",
     # training hyperparams
     batch_size: int = 128,
-    micro_batch_size: int = 4,
-    num_epochs: int = 3,
+    micro_batch_size: int = 1,
+    num_epochs: int = 1,
     learning_rate: float = 3e-4,
-    cutoff_len: int = 256,
-    val_set_size: int = 2000,
+    lr_scheduler_type: str = "linear",
+    cutoff_len: int = 2048,
+    val_set_size: int = 0.2,
     eval_steps: int = 100,
     save_steps: int = 10,
     logging_steps: int = 10,
@@ -146,28 +153,31 @@ def train(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     lora_target_modules: List[str] = (
-        "q_proj",
-        "v_proj",
+        "w1",
+        "w2",
+        "mlp.c_proj",
     ),
     # llm hyperparams
     train_on_inputs: bool = True,  # if False, masks out inputs in loss
-    add_eos_token: bool = False,
+    add_eos_token: bool = True,
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
     # wandb params
-    wandb_project: str = "",
+    wandb_project: str = "huggingface",
     wandb_run_name: str = "",
     wandb_watch: str = "",  # options: false | gradients | all
     wandb_log_model: str = "",  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
-    prompt_template: str = "vicuna",  # The prompt template to use, will default to alpaca.
+    prompt_template: str = "alpaca",  # The prompt template to use, will default to alpaca.
     # memory optimization params
-    mode: Union[int, str] = 8,  # training floating point mode
-    gradient_checkpointing: bool = False,
+    gradient_checkpointing: bool = True,
     # GPTQ specific params
     gptq_backend: str = "cuda",  # GPTQ backend "cuda" or "triton"
     gptq_groupsize: int = 128,
     # evaluation flag
     eval: bool = False,
+    max_steps: int = -1,
+    activation_type: str = "bf16",
+    mode: Union[int, str] = 16,
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -177,11 +187,11 @@ def train(
             f"output_dir: {output_dir}\n"
             f"batch_size: {batch_size}\n"
             f"micro_batch_size: {micro_batch_size}\n"
-            f"mode: {mode}\n"
             f"eval: {eval}\n"
             f"gradient_checkpointing: {gradient_checkpointing}\n"
             f"num_epochs: {num_epochs}\n"
             f"learning_rate: {learning_rate}\n"
+            f"lr_scheduler_type: {lr_scheduler_type}\n"
             f"cutoff_len: {cutoff_len}\n"
             f"val_set_size: {val_set_size}\n"
             f"eval_steps: {eval_steps}\n"
@@ -200,10 +210,14 @@ def train(
             f"wandb_log_model: {wandb_log_model}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt_template: {prompt_template}\n"
+            f"max_steps: {max_steps}\n"
+            f"mode: {mode}\n"
+            f"activation_type: {activation_type}\n"
         )
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+
     gradient_accumulation_steps = batch_size // micro_batch_size
 
     prompter = PromptSelector.from_template_name(prompt_template, verbose=False)
@@ -219,7 +233,7 @@ def train(
     use_wandb = len(wandb_project) > 0 or (
         "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
     )
-    print("use_wandb", use_wandb)
+
     # Only overwrite environ if wandb param passed
     if len(wandb_project) > 0:
         os.environ["WANDB_PROJECT"] = wandb_project
@@ -238,63 +252,84 @@ def train(
         task_type="CAUSAL_LM",
     )
 
-    if isinstance(mode, int):
-        # use HF loader for normal model loading with bitsandbytes quantization
-        model, tokenizer = load_hf_model(
-            base_model,
-            lora_config,
-            mode=mode,
-            gradient_checkpointing=gradient_checkpointing,
-            device_map=device_map,
-        )
+    if activation_type != "bf16" and activation_type != "fp16":
+        print("please set activation_type = bf16 or fp16")
+        return
 
-        # setup model checkpoint if neeeded
-        if resume_from_checkpoint:
-            # Check the available weights and load them
-            checkpoint_name = os.path.join(
-                resume_from_checkpoint, "pytorch_model.bin"
-            )  # Full checkpoint
-            if not os.path.exists(checkpoint_name):
-                checkpoint_name = os.path.join(
-                    resume_from_checkpoint, "adapter_model.bin"
-                )  # only LoRA model - LoRA config above has to fit
-            # The two files above have a different name depending on how they were saved, but are actually the same.
-            if os.path.exists(checkpoint_name):
-                print(f"Restarting from {checkpoint_name}")
-                adapters_weights = torch.load(checkpoint_name, map_location="cpu")
-                set_peft_model_state_dict(model, adapters_weights)
-            else:
-                print(f"Checkpoint {checkpoint_name} not found")
+    is_use_bf16 = activation_type == "bf16"
+    is_use_fp16 = activation_type == "fp16"
+    torch_dtype = torch.float16 if activation_type == "fp16" else torch.bfloat16
 
-    elif mode == "gptq":
-        from utils.loader.gptq_loader import load_model_gptq
-
-        kwargs = {
-            "gradient_checkpointing": gradient_checkpointing,
-            "device_map": device_map,
-            "group_size": gptq_groupsize,
-            "backend": gptq_backend,
-        }
-        if resume_from_checkpoint:
-            kwargs.update(
-                {
-                    "lora_path": resume_from_checkpoint,
-                    "load_lora": True,
-                    "lora_trainable": True,
-                }
-            )
-            print(f"Restarting from {resume_from_checkpoint}")
-
-        model, tokenizer = load_model_gptq(
-            base_model,
-            lora_config,
-            **kwargs,
+    kwargs = {"device_map": device_map}
+    if mode == 16:
+        kwargs["torch_dtype"] = torch_dtype
+    elif mode == 4:
+        kwargs["torch_dtype"] = torch_dtype
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
         )
     else:
         raise NotImplementedError(f"Mode '{mode}' is not supported.")
 
+    # setup tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model, use_fast=False, trust_remote_code=True
+    )
+    if tokenizer.__class__.__name__ == "QWenTokenizer":
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            fp16=is_use_fp16,
+            bf16=is_use_bf16,
+            trust_remote_code=True,
+            **kwargs,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model, trust_remote_code=True, **kwargs
+        )
+
+    if gradient_checkpointing:
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
+
+    if mode != 16:
+        # model = prepare_model_for_kbit_training(model)
+        model = ours_prepare_model_for_kbit_training(model)
+
+    if lora_config:
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+
+    # setup model checkpoint if neeeded
+    if resume_from_checkpoint:
+        # Check the available weights and load them
+        checkpoint_name = os.path.join(
+            resume_from_checkpoint, "pytorch_model.bin"
+        )  # Full checkpoint
+        if not os.path.exists(checkpoint_name):
+            checkpoint_name = os.path.join(
+                resume_from_checkpoint, "adapter_model.bin"
+            )  # only LoRA model - LoRA config above has to fit
+        # The two files above have a different name depending on how they were saved, but are actually the same.
+        if os.path.exists(checkpoint_name):
+            print(f"Restarting from {checkpoint_name}")
+            adapters_weights = torch.load(checkpoint_name, map_location="cpu")
+            set_peft_model_state_dict(model, adapters_weights)
+        else:
+            print(f"Checkpoint {checkpoint_name} not found")
+
+    print(f"{model}")
+
     tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
     tokenizer.padding_side = "left"  # Allow batched inference
+
+    if tokenizer.__class__.__name__ == "QWenTokenizer":
+        tokenizer.pad_token_id = tokenizer.eod_id
+        tokenizer.bos_token_id = tokenizer.eod_id
+        tokenizer.eos_token_id = tokenizer.eod_id
 
     def tokenize(prompt, add_eos_token=True):
         # there's probably a way to do this with the tokenizer settings
@@ -350,7 +385,7 @@ def train(
             train_val = train_data.train_test_split(
                 test_size=val_set_size, shuffle=True, seed=42
             )
-            train_data = train_val["train"].shuffle()
+            train_data = train_val["train"].shuffle(seed=42)
             val_data = train_val["test"]
         else:
             val_data = None
@@ -373,10 +408,16 @@ def train(
             train_val = data["train"].train_test_split(
                 test_size=val_set_size, shuffle=True, seed=42
             )
-            train_data = train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-            val_data = train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            train_data = (
+                train_val["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+            )
+            val_data = (
+                train_val["test"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+            )
         else:
-            train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
+            train_data = (
+                data["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+            )
             val_data = data["test"].map(generate_and_tokenize_prompt)
 
     if not ddp and torch.cuda.device_count() > 1:
@@ -389,32 +430,37 @@ def train(
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         model.save_pretrained(output_dir)
 
+    trainArg = transformers.TrainingArguments(
+        per_device_train_batch_size=micro_batch_size,
+        per_device_eval_batch_size=micro_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        warmup_steps=100,
+        max_steps=max_steps,
+        num_train_epochs=num_epochs,
+        learning_rate=learning_rate,
+        lr_scheduler_type=lr_scheduler_type,
+        bf16=is_use_bf16,
+        fp16=is_use_fp16,
+        logging_steps=10,
+        optim="paged_adamw_8bit" if mode in [4, 8] else "adamw_torch",
+        evaluation_strategy="steps" if eval_steps > 0 else "no",
+        save_strategy="steps",
+        eval_steps=eval_steps if eval_steps > 0 else None,
+        save_steps=save_steps,
+        output_dir=output_dir,
+        save_total_limit=3,
+        load_best_model_at_end=False,
+        ddp_find_unused_parameters=False if ddp else None,
+        group_by_length=group_by_length,
+        report_to="wandb" if use_wandb else None,
+        run_name=wandb_run_name if use_wandb else None,
+    )
+
     trainer = PeftTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=micro_batch_size,
-            per_device_eval_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=100,
-            num_train_epochs=num_epochs,
-            learning_rate=learning_rate,
-            fp16=True,
-            logging_steps=logging_steps,
-            optim="paged_adamw_8bit" if mode in [4, 8] else "adamw_torch",
-            evaluation_strategy="steps" if eval_steps > 0 else "no",
-            save_strategy="steps",
-            eval_steps=eval_steps if eval_steps > 0 else None,
-            save_steps=save_steps,
-            output_dir=output_dir,
-            save_total_limit=3,
-            load_best_model_at_end=False,
-            ddp_find_unused_parameters=False if ddp else None,
-            group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
-            run_name=wandb_run_name if use_wandb else None,
-        ),
+        args=trainArg,
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
