@@ -452,7 +452,7 @@ def train(
         load_best_model_at_end=False,
         ddp_find_unused_parameters=False if ddp else None,
         group_by_length=group_by_length,
-        report_to="wandb" if use_wandb else None,
+        report_to="none",
         run_name=wandb_run_name if use_wandb else None,
     )
 
