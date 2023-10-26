@@ -2,6 +2,8 @@ checkpoint_dir="/workspace/Qwen-14B"
 data_path="/workspace/alpaca_data_excerpt.json"
 output_dir="./output-Q14_bf16"
 
+ulimit -a
+
 python3 finetune.py \
     --base_model $checkpoint_dir \
     --data_path $data_path \
